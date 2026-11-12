@@ -33,24 +33,58 @@ def parse_json(text: str):
     return json.loads(raw[start:])
 
 
+def normalize_handle(raw: str) -> str:
+    """'@abc', 'x.com/abc', 'https://twitter.com/abc?s=20' 등을 'abc'로."""
+    s = raw.strip()
+    m = re.search(r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})", s)
+    if m:
+        return m.group(1)
+    return s.lstrip("@").strip()
+
+
+def clean_token(raw: str) -> str:
+    t = raw.strip().strip('"').strip("'")
+    if t.lower().startswith("bearer "):
+        t = t[7:].strip()
+    return t
+
+
+def x_get(url, headers, params, what):
+    """5xx는 최대 3번 재시도, 실패 시 원인 파악용 정보까지 담아 에러."""
+    import time
+    for attempt in range(3):
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        if r.status_code < 500:
+            break
+        time.sleep(1.5 * (attempt + 1))
+    if r.status_code != 200:
+        hint = {
+            401: "토큰이 잘못됐어요. Bearer Token을 다시 복사해 보세요.",
+            402: "크레딧이 부족해요. console.x.com → Billing에서 충전하세요.",
+            403: "권한/크레딧 문제일 수 있어요. 콘솔에서 앱 상태와 크레딧을 확인하세요.",
+            429: "요청 한도 초과예요. 잠시 후 다시 시도하세요.",
+        }.get(r.status_code, "X 서버 쪽 오류일 수 있어요. 아래 '연결 테스트'로 원인을 좁혀보세요." if r.status_code >= 500 else "")
+        body = r.text[:300] or "(응답 본문 없음)"
+        raise RuntimeError(f"{what} 실패 ({r.status_code}) {hint}\n{body}")
+    return r
+
+
 # ---------- X 수집 ----------
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def fetch_x(handle: str, max_posts: int, include_replies: bool, _token: str):
     """핸들의 프로필 + 최근 게시물. 같은 입력은 24시간 캐시(재과금 방지)."""
     headers = {"Authorization": f"Bearer {_token}"}
 
-    r = requests.get(
+    r = x_get(
         f"{X_API}/users/by/username/{handle}",
-        headers=headers,
-        params={
+        headers,
+        {
             "user.fields": "description,location,public_metrics,protected",
             "expansions": "pinned_tweet_id",
             "tweet.fields": "text",
         },
-        timeout=20,
+        "사용자 조회",
     )
-    if r.status_code != 200:
-        raise RuntimeError(f"사용자 조회 실패 ({r.status_code}): {r.text[:300]}")
     body = r.json()
     if "data" not in body:
         raise RuntimeError(f"계정을 찾을 수 없어요: {body.get('errors', body)}")
@@ -69,10 +103,7 @@ def fetch_x(handle: str, max_posts: int, include_replies: bool, _token: str):
             params["exclude"] = "replies"
         if token:
             params["pagination_token"] = token
-        r = requests.get(f"{X_API}/users/{user['id']}/tweets",
-                         headers=headers, params=params, timeout=20)
-        if r.status_code != 200:
-            raise RuntimeError(f"게시물 조회 실패 ({r.status_code}): {r.text[:300]}")
+        r = x_get(f"{X_API}/users/{user['id']}/tweets", headers, params, "게시물 조회")
         page = r.json()
         for t in page.get("data", []):
             kind = "RT" if any(x["type"] == "retweeted" for x in t.get("referenced_tweets", []) or []) else "글"
@@ -186,7 +217,11 @@ with st.expander("🔑 API 키", expanded=not (secret("X_BEARER_TOKEN") and secr
     claude_key = st.text_input("Anthropic API Key", value=secret("ANTHROPIC_API_KEY"), type="password")
     st.caption("입력한 키는 저장되지 않아요. 매번 입력하기 싫으면 Streamlit Secrets에 넣어두세요.")
 
-handle = st.text_input("X 계정", placeholder="@handle").strip().lstrip("@")
+handle = normalize_handle(st.text_input("X 계정", placeholder="@handle 또는 프로필 링크"))
+x_token = clean_token(x_token)
+claude_key = claude_key.strip()
+if handle and not re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle):
+    st.warning("계정 아이디는 영문·숫자·밑줄 15자 이내예요. 표시 이름(닉네임)이 아니라 @ 뒤의 아이디를 넣어주세요.")
 c1, c2 = st.columns(2)
 budget = c1.number_input("예산(원)", min_value=5000, value=50000, step=10000)
 relation = c2.selectbox("관계", ["친구", "연인", "가족", "직장 동료", "지인/팔로워"])
@@ -196,6 +231,13 @@ extra = st.text_input("추가 요청 (선택)", placeholder="예: 실용적인 �
 with st.expander("⚙️ 수집 옵션"):
     max_posts = st.slider("읽을 게시물 수", 50, 500, 200, step=50)
     include_replies = st.checkbox("답글 포함", value=False)
+    if st.button("🔌 X 연결 테스트 (@XDevelopers 조회)"):
+        try:
+            r = x_get(f"{X_API}/users/by/username/XDevelopers",
+                      {"Authorization": f"Bearer {x_token}"}, {}, "연결 테스트")
+            st.success(f"연결 OK: {r.json().get('data', {}).get('name')} — 문제는 입력한 계정 쪽이에요.")
+        except Exception as e:
+            st.error(str(e))
     st.caption(f"예상 X API 비용: 약 ${max_posts * 0.005:.2f} (게시물 1개당 $0.005 기준, 같은 조건은 24시간 캐시)")
 
 if st.button("분석하고 추천받기", type="primary", use_container_width=True):
