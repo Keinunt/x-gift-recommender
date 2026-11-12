@@ -3,9 +3,15 @@
 - X API v2 (Bearer Token)로 공개 게시물 수집
 - Claude로 취향 분석 → 선물 추천
 """
+import hashlib
 import json
+import os
 import re
+import tempfile
+import threading
+import time
 import urllib.parse
+import uuid
 
 import requests
 import streamlit as st
@@ -81,9 +87,8 @@ def x_get(url, headers, params, what):
 
 
 # ---------- X 수집 ----------
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def fetch_x(handle: str, max_posts: int, include_replies: bool, _token: str):
-    """핸들의 프로필 + 최근 게시물. 같은 입력은 24시간 캐시(재과금 방지)."""
+def fetch_x_raw(handle: str, max_posts: int, include_replies: bool, _token: str):
+    """핸들의 프로필 + 최근 게시물 (X API 호출)."""
     headers = {"Authorization": f"Bearer {_token}"}
 
     r = x_get(
@@ -127,13 +132,26 @@ def fetch_x(handle: str, max_posts: int, include_replies: bool, _token: str):
 
 
 # ---------- Claude ----------
-def ask_claude(client: Anthropic, prompt: str, max_tokens: int = 4000) -> str:
-    msg = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return "".join(b.text for b in msg.content if b.type == "text")
+def ask_json(client: Anthropic, prompt: str, max_tokens: int):
+    """JSON 응답 요청. 잘리거나 파싱 실패 시 한 번 더 시도."""
+    last = None
+    for _ in range(2):
+        msg = client.messages.create(
+            model=MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in msg.content if b.type == "text")
+        try:
+            return parse_json(text)
+        except Exception as e:
+            cut = " (응답이 길어서 잘림)" if msg.stop_reason == "max_tokens" else ""
+            last = f"{e}{cut}"
+    raise RuntimeError(f"Claude 응답을 해석하지 못했어요: {last}")
+
+
+JSON_RULES = ("출력 규칙: 값 안에서는 큰따옴표(\")를 쓰지 말고 작은따옴표나 괄호를 써. "
+              "evidence는 원문을 30자 이내로 줄여서. 줄바꿈 없이 한 줄로.")
 
 
 def analyze_profile(client, data):
@@ -156,7 +174,7 @@ def analyze_profile(client, data):
 [게시물]
 {posts_txt}
 
-JSON만 출력:
+JSON만 출력 (interests·wishlist·owned는 각 최대 8개): {JSON_RULES}
 {{
   "summary": "한두 문장 요약",
   "interests": [{{"name": "", "strength": "상/중/하", "evidence": "근거가 된 게시물 짧은 발췌"}}],
@@ -166,7 +184,7 @@ JSON만 출력:
   "dislikes": ["싫어하는 것"],
   "style": "선호 스타일/미감 (근거 있을 때만)"
 }}"""
-    return parse_json(ask_claude(client, prompt))
+    return ask_json(client, prompt, 8000)
 
 
 def recommend(client, handle, profile, budget, relation, occasion, extra):
@@ -188,7 +206,7 @@ def recommend(client, handle, profile, budget, relation, occasion, extra):
 - 관계에 비해 부담스럽거나 너무 사적인 선물은 피해.
 - 8개 추천, 확신도 높은 순.
 
-JSON만 출력:
+JSON만 출력: {JSON_RULES}
 {{"recommendations": [{{
   "name": "선물 이름",
   "price": "예상 가격대",
@@ -197,7 +215,82 @@ JSON만 출력:
   "search_keyword": "쇼핑몰 검색용 키워드",
   "confidence": "상/중/하"
 }}]}}"""
-    return parse_json(ask_claude(client, prompt))["recommendations"]
+    return ask_json(client, prompt, 8000)["recommendations"]
+
+
+# ---------- 디스크 저장소 (작업·캐시: 연결이 끊겨도 서버에 남음) ----------
+BASE = os.path.join(tempfile.gettempdir(), "xgift")
+os.makedirs(BASE, exist_ok=True)
+CACHE_TTL = 60 * 60 * 24
+JOB_STALE = 300  # 이 시간(초) 동안 갱신이 없으면 서버가 재시작된 것으로 본다
+
+
+def _write(path: str, obj) -> None:
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _read(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def cleanup_old(days: int = 3) -> None:
+    now = time.time()
+    for name in os.listdir(BASE):
+        p = os.path.join(BASE, name)
+        try:
+            if now - os.path.getmtime(p) > days * 86400:
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def fetch_x(handle: str, max_posts: int, include_replies: bool, token: str):
+    """24시간 디스크 캐시. 끊겼다 다시 실행해도 X 비용이 또 나가지 않는다."""
+    key = hashlib.sha1(f"{handle.lower()}|{max_posts}|{include_replies}".encode()).hexdigest()[:16]
+    path = os.path.join(BASE, f"x_{key}.json")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL:
+        cached = _read(path)
+        if cached:
+            return cached
+    data = fetch_x_raw(handle, max_posts, include_replies, token)
+    _write(path, data)
+    return data
+
+
+def job_path(job_id: str) -> str:
+    return os.path.join(BASE, f"job_{re.sub(r'[^a-f0-9]', '', job_id)}.json")
+
+
+def job_update(job_id: str, **fields) -> None:
+    job = _read(job_path(job_id)) or {}
+    job.update(fields, ts=time.time())
+    _write(job_path(job_id), job)
+
+
+def run_job(job_id, handle, max_posts, include_replies, x_token, claude_key,
+            budget, relation, occasion, extra):
+    """백그라운드 스레드: 브라우저 연결과 무관하게 서버에서 끝까지 실행."""
+    try:
+        client = Anthropic(api_key=claude_key)
+        job_update(job_id, step="📥 게시물 수집 중")
+        data = fetch_x(handle, max_posts, include_replies, x_token)
+        if not data["posts"]:
+            raise RuntimeError("읽을 수 있는 게시물이 없어요.")
+        job_update(job_id, step=f"🧠 취향 분석 중 (게시물 {len(data['posts'])}개)")
+        profile = analyze_profile(client, data)
+        job_update(job_id, step="🎁 선물 고르는 중")
+        recs = recommend(client, handle, profile, budget, relation, occasion, extra)
+        job_update(job_id, status="done", step="완료",
+                   result={"handle": handle, "profile": profile, "recs": recs, "n": len(data["posts"])})
+    except Exception as e:
+        job_update(job_id, status="error", error=str(e))
 
 
 def shop_links(kw: str) -> str:
@@ -251,29 +344,7 @@ with st.expander("⚙️ 수집 옵션"):
             st.error(str(e))
     st.caption(f"예상 X API 비용: 약 ${max_posts * 0.005:.2f} (게시물 1개당 $0.005 기준, 같은 조건은 24시간 캐시)")
 
-if st.button("분석하고 추천받기", type="primary", use_container_width=True):
-    if not (x_token and claude_key and handle):
-        st.warning("키 두 개와 계정을 모두 입력해 주세요.")
-        st.stop()
-    client = Anthropic(api_key=claude_key)
-    try:
-        with st.status("작업 중...", expanded=True) as status:
-            st.write("📥 게시물 수집 중")
-            data = fetch_x(handle, max_posts, include_replies, x_token)
-            if not data["posts"]:
-                raise RuntimeError("읽을 수 있는 게시물이 없어요.")
-            st.write(f"✅ {len(data['posts'])}개 수집")
-            st.write("🧠 취향 분석 중")
-            profile = analyze_profile(client, data)
-            st.write("🎁 선물 고르는 중")
-            recs = recommend(client, handle, profile, budget, relation, occasion, extra)
-            status.update(label="완료", state="complete", expanded=False)
-        st.session_state.result = {"handle": handle, "profile": profile, "recs": recs, "n": len(data["posts"])}
-    except Exception as e:
-        st.error(f"오류: {e}")
-
-res = st.session_state.get("result")
-if res:
+def render_result(res):
     p = res["profile"]
     st.subheader(f"@{res['handle']} 취향 요약")
     st.write(p.get("summary", ""))
@@ -292,3 +363,46 @@ if res:
             if r.get("evidence"):
                 st.caption(f"근거: “{r['evidence']}”")
             st.markdown(shop_links(r.get("search_keyword") or r["name"]))
+
+
+@st.fragment(run_every=2)
+def watch_job(job_id: str):
+    job = _read(job_path(job_id)) or {}
+    if job.get("status") != "running":
+        st.rerun()
+    if time.time() - job.get("ts", 0) > JOB_STALE:
+        st.rerun()
+    st.info(f"{job.get('step', '시작 중')}\n\n다른 앱에 다녀와도 서버에서 계속 진행돼요. 이 화면은 자동으로 갱신돼요.")
+
+
+cleanup_old()
+
+if st.button("분석하고 추천받기", type="primary", use_container_width=True):
+    if not (x_token and claude_key and handle):
+        st.warning("키 두 개와 계정을 모두 입력해 주세요.")
+        st.stop()
+    new_id = uuid.uuid4().hex
+    job_update(new_id, status="running", step="시작 중", handle=handle)
+    threading.Thread(
+        target=run_job, daemon=True,
+        args=(new_id, handle, max_posts, include_replies, x_token, claude_key,
+              budget, relation, occasion, extra),
+    ).start()
+    st.query_params["job"] = new_id  # 주소에 작업 번호를 남겨 두면 끊겼다 돌아와도 이어서 볼 수 있다
+    st.rerun()
+
+job_id = st.query_params.get("job")
+if job_id:
+    job = _read(job_path(job_id))
+    if not job:
+        st.warning("이 작업을 찾을 수 없어요 (서버가 재시작됐거나 3일이 지났어요). 다시 실행해 주세요.")
+    elif job.get("status") == "running":
+        if time.time() - job.get("ts", 0) > JOB_STALE:
+            st.warning("작업이 중간에 멈춘 것 같아요 (서버 재시작 등). 같은 조건으로 다시 누르면 "
+                       "수집한 게시물은 캐시에서 가져와서 X 비용이 또 들지 않아요.")
+        else:
+            watch_job(job_id)
+    elif job.get("status") == "error":
+        st.error(f"오류: {job.get('error')}")
+    elif job.get("status") == "done":
+        render_result(job["result"])
