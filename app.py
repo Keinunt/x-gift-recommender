@@ -50,22 +50,33 @@ def clean_token(raw: str) -> str:
 
 
 def x_get(url, headers, params, what):
-    """5xx는 최대 3번 재시도, 실패 시 원인 파악용 정보까지 담아 에러."""
+    """5xx는 재시도 후 api.twitter.com으로도 시도. 실패 시 진단 정보를 에러에 담는다."""
     import time
-    for attempt in range(3):
-        r = requests.get(url, headers=headers, params=params, timeout=20)
+    alt = url.replace("https://api.x.com/", "https://api.twitter.com/")
+    r = None
+    for target in (url, alt):
+        for attempt in range(2):
+            r = requests.get(target, headers=headers, params=params, timeout=20)
+            if r.status_code < 500:
+                break
+            time.sleep(1.5 * (attempt + 1))
         if r.status_code < 500:
             break
-        time.sleep(1.5 * (attempt + 1))
     if r.status_code != 200:
         hint = {
             401: "토큰이 잘못됐어요. Bearer Token을 다시 복사해 보세요.",
             402: "크레딧이 부족해요. console.x.com → Billing에서 충전하세요.",
             403: "권한/크레딧 문제일 수 있어요. 콘솔에서 앱 상태와 크레딧을 확인하세요.",
             429: "요청 한도 초과예요. 잠시 후 다시 시도하세요.",
-        }.get(r.status_code, "X 서버 쪽 오류일 수 있어요. 아래 '연결 테스트'로 원인을 좁혀보세요." if r.status_code >= 500 else "")
+        }.get(r.status_code, "X 서버 쪽 오류일 수 있어요." if r.status_code >= 500 else "")
+        tok = headers.get("Authorization", "").replace("Bearer ", "")
+        diag = (f"[진단] 토큰 길이 {len(tok)}자, 시작 {tok[:4]!r} / "
+                f"server={r.headers.get('server', '-')}, "
+                f"content-type={r.headers.get('content-type', '-')}, "
+                f"x-transaction-id={r.headers.get('x-transaction-id', '-')}, "
+                f"cf-ray={r.headers.get('cf-ray', '-')}")
         body = r.text[:300] or "(응답 본문 없음)"
-        raise RuntimeError(f"{what} 실패 ({r.status_code}) {hint}\n{body}")
+        raise RuntimeError(f"{what} 실패 ({r.status_code}) {hint}\n{body}\n{diag}")
     return r
 
 
